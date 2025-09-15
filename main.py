@@ -1,10 +1,11 @@
 # main.py
-from datetime import date, time, datetime, timedelta
+from datetime import date, time
 from typing import List, Optional
-import os
-import logging
+import os, logging
+import datetime as dt
+import httpx
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator, Field
 import databases
@@ -13,7 +14,7 @@ import secrets
 # ========= DB =========
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL が未設定です（Render の環境変数に設定してください）")
+    raise RuntimeError("DATABASE_URL が未設定です（本番環境の環境変数に設定してください）")
 
 database = databases.Database(DATABASE_URL)
 
@@ -21,7 +22,7 @@ database = databases.Database(DATABASE_URL)
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 本番は許可ドメインに絞ってください
+    allow_origins=["*"],  # 本番はフロントのドメインに絞ってください
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -48,7 +49,7 @@ class ShiftIn(BaseModel):
     day: int
     start_work: Optional[time] = None
     end_work: Optional[time] = None
-    # 可変デフォルトは Field(default_factory=list) に
+    # 可変デフォルトは Field(default_factory=list)
     breaks: List[BreakIn] = Field(default_factory=list)
 
     @field_validator("end_work")
@@ -124,6 +125,19 @@ async def ensure_onboarding_table():
     );
     """)
 
+async def ensure_oauth_table():
+    await database.execute("""
+    CREATE TABLE IF NOT EXISTS oauth_token (
+      provider      TEXT PRIMARY KEY,         -- 'freee'
+      access_token  TEXT NOT NULL,
+      refresh_token TEXT NOT NULL,
+      expires_at    TIMESTAMP NOT NULL,       -- UTC
+      token_type    TEXT,
+      scope         TEXT,
+      updated_at    TIMESTAMP NOT NULL DEFAULT NOW()
+    );
+    """)
+
 # ========= DB lazy connect =========
 async def ensure_db_ready():
     """必要なときだけ DB 接続 & 初回 DDL 実行。未準備なら 503 を返す。"""
@@ -136,12 +150,13 @@ async def ensure_db_ready():
     if not getattr(app.state, "ddl_done", False):
         await ensure_binding_table()
         await ensure_onboarding_table()
+        await ensure_oauth_table()
         app.state.ddl_done = True
 
 # ========= Lifecycle =========
 @app.on_event("startup")
 async def startup():
-    # 起動時は DB に繋がない（Render の起動順による接続拒否で落ちないように）
+    # 起動時は DB に繋がない（PaaS の起動順依存を避ける）
     pass
 
 @app.on_event("shutdown")
@@ -164,7 +179,7 @@ async def post_shift(p: ShiftIn):
                 f"DELETE FROM {BREAK_TBL} WHERE id = :id AND work_date = :wd",
                 {"id": p.employee_id, "wd": p.work_date},
             )
-            # 2) 勤務 削除
+            # 2) 勤務 全削除
             await database.execute(
                 f"DELETE FROM {WORK_TBL} WHERE id = :id AND work_date = :wd",
                 {"id": p.employee_id, "wd": p.work_date},
@@ -194,6 +209,7 @@ async def post_shift(p: ShiftIn):
 @app.get("/getDetailShifts")
 async def get_shifts(year: int = Query(...), month: int = Query(...), day: int = Query(...)):
     await ensure_db_ready()
+    await ensure_month_tables(year, month)
 
     work_tbl, break_tbl = table_names_for(year, month)
     wd = date(year, month, day)
@@ -227,6 +243,7 @@ async def get_shifts(year: int = Query(...), month: int = Query(...), day: int =
 @app.get("/getWorkMonth")
 async def get_work_month(id: int = Query(..., alias="id"), year: int = Query(...), month: int = Query(...)):
     await ensure_db_ready()
+    await ensure_month_tables(year, month)
 
     work_tbl, _ = table_names_for(year, month)
     rows = await database.fetch_all(
@@ -251,11 +268,10 @@ async def get_work_month(id: int = Query(..., alias="id"), year: int = Query(...
 @app.post("/onboarding/code")
 async def issue_code(payload: dict):
     await ensure_db_ready()
-
     """管理用: 6桁コード発行（有効10分）"""
     employee_id = int(payload.get("employee_id"))
     code = f"{secrets.randbelow(1_000_000):06d}"
-    expires = datetime.utcnow() + timedelta(minutes=10)
+    expires = dt.datetime.utcnow() + dt.timedelta(minutes=10)
     await database.execute(
         "INSERT INTO onboarding_code (employee_id, code, expires_at) VALUES (:e,:c,:x)",
         {"e": employee_id, "c": code, "x": expires},
@@ -275,7 +291,7 @@ async def bind_from_liff(p: LiffBindIn):
         raise HTTPException(403, "invalid code")
     if row["used_at"] is not None:
         raise HTTPException(403, "code already used")
-    if row["expires_at"] < datetime.utcnow():
+    if row["expires_at"] < dt.datetime.utcnow():
         raise HTTPException(403, "code expired")
 
     # 既存の別社員への紐付けをブロック
@@ -318,7 +334,81 @@ async def list_bindings(active: Optional[bool] = None):
     """, params)
     return [dict(r) for r in rows]
 
-# ヘルスチェック（DB 非依存に）
+# ヘルスチェック（DB 非依存）
 @app.get("/healthz")
 async def healthz():
+    return {"ok": True}
+
+# ========= Freee OAuth token 管理 =========
+FREEE_TOKEN_URL = "https://accounts.secure.freee.co.jp/public_api/token"
+CLIENT_ID = os.getenv("FREEE_CLIENT_ID")
+CLIENT_SECRET = os.getenv("FREEE_CLIENT_SECRET")
+INTERNAL_SECRET = os.getenv("INTERNAL_API_KEY")
+SKEW = dt.timedelta(seconds=60)
+
+async def _get_freee_row():
+    return await database.fetch_one("SELECT * FROM oauth_token WHERE provider='freee'")
+
+async def _save_freee_row(at, rt, exp, typ=None, scope=None):
+    await database.execute("""
+      INSERT INTO oauth_token(provider,access_token,refresh_token,expires_at,token_type,scope,updated_at)
+      VALUES('freee', :at, :rt, :exp, :typ, :scope, NOW())
+      ON CONFLICT (provider) DO UPDATE
+      SET access_token=:at, refresh_token=:rt, expires_at=:exp, token_type=:typ, scope=:scope, updated_at=NOW()
+    """, {"at": at, "rt": rt, "exp": exp, "typ": typ, "scope": scope})
+
+async def _refresh_with_freee(rt: str):
+    async with httpx.AsyncClient(timeout=15) as cli:
+        resp = await cli.post(
+            FREEE_TOKEN_URL,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": rt,
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
+            },
+        )
+    if resp.status_code != 200:
+        raise HTTPException(502, f"freee token refresh failed: {resp.text}")
+    j = resp.json()
+    exp = dt.datetime.utcnow() + dt.timedelta(seconds=j.get("expires_in", 21600)) - SKEW
+    # freee は refresh_token がローテーションすることがある → あれば必ず保存
+    return j["access_token"], j.get("refresh_token", rt), exp, j.get("token_type"), j.get("scope")
+
+@app.get("/oauth/freee/access_token")
+async def issue_access_token(x_internal_secret: str = Header(None)):
+    await ensure_db_ready()
+    if x_internal_secret != INTERNAL_SECRET:
+        raise HTTPException(403, "forbidden")
+
+    row = await _get_freee_row()
+    if not row:
+        raise HTTPException(404, "seed required")
+
+    now = dt.datetime.utcnow()
+    if row["expires_at"] and row["expires_at"] > now + SKEW:
+        return {"access_token": row["access_token"], "expires_at": row["expires_at"].isoformat()}
+
+    # 期限切れ/間近 → リフレッシュ（簡易二重実行対策で再読込）
+    async with database.transaction():
+        row = await _get_freee_row()
+        if row["expires_at"] and row["expires_at"] > dt.datetime.utcnow() + SKEW:
+            return {"access_token": row["access_token"], "expires_at": row["expires_at"].isoformat()}
+        at, rt, exp, typ, scope = await _refresh_with_freee(row["refresh_token"])
+        await _save_freee_row(at, rt, exp, typ, scope)
+        return {"access_token": at, "expires_at": exp.isoformat()}
+
+# 初期投入（最初の1回だけ）※終わったら無効化してもOK
+@app.post("/oauth/freee/seed")
+async def seed_token(payload: dict, x_internal_secret: str = Header(None)):
+    await ensure_db_ready()
+    if x_internal_secret != INTERNAL_SECRET:
+        raise HTTPException(403, "forbidden")
+    at = payload["access_token"]
+    rt = payload["refresh_token"]
+    exp = payload.get("expires_at")  # ISO でも秒でも可
+    if isinstance(exp, (int, float)):
+        exp = (dt.datetime.utcnow() + dt.timedelta(seconds=exp)).isoformat()
+    await _save_freee_row(at, rt, dt.datetime.fromisoformat(exp.replace("Z","")))
     return {"ok": True}
