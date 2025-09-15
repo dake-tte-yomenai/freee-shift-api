@@ -1,18 +1,19 @@
 # main.py
 from datetime import date, time, datetime, timedelta
 from typing import List, Optional
+import os
+import logging
+
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, Field
 import databases
 import secrets
-import os  
 
 # ========= DB =========
-# DATABASE_URL = "postgresql+asyncpg://postgres:baka080Anto@localhost:5433/freeeShiftDB"
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL が未設定です（本番では Render の環境変数に入れます）")
+    raise RuntimeError("DATABASE_URL が未設定です（Render の環境変数に設定してください）")
 
 database = databases.Database(DATABASE_URL)
 
@@ -47,7 +48,8 @@ class ShiftIn(BaseModel):
     day: int
     start_work: Optional[time] = None
     end_work: Optional[time] = None
-    breaks: List[BreakIn] = []
+    # 可変デフォルトは Field(default_factory=list) に
+    breaks: List[BreakIn] = Field(default_factory=list)
 
     @field_validator("end_work")
     @classmethod
@@ -122,20 +124,36 @@ async def ensure_onboarding_table():
     );
     """)
 
+# ========= DB lazy connect =========
+async def ensure_db_ready():
+    """必要なときだけ DB 接続 & 初回 DDL 実行。未準備なら 503 を返す。"""
+    if not database.is_connected:
+        try:
+            await database.connect()
+        except Exception as e:
+            logging.exception("DB not ready: %s", e)
+            raise HTTPException(status_code=503, detail="Database not ready")
+    if not getattr(app.state, "ddl_done", False):
+        await ensure_binding_table()
+        await ensure_onboarding_table()
+        app.state.ddl_done = True
+
 # ========= Lifecycle =========
 @app.on_event("startup")
 async def startup():
-    await database.connect()
-    await ensure_binding_table()
-    await ensure_onboarding_table()
+    # 起動時は DB に繋がない（Render の起動順による接続拒否で落ちないように）
+    pass
 
 @app.on_event("shutdown")
 async def shutdown():
-    await database.disconnect()
+    if database.is_connected:
+        await database.disconnect()
 
 # ========= Shifts APIs =========
 @app.post("/postShifts")
 async def post_shift(p: ShiftIn):
+    await ensure_db_ready()
+
     WORK_TBL, BREAK_TBL = table_names_for(p.year, p.month)
     try:
         await ensure_month_tables(p.year, p.month)
@@ -175,6 +193,8 @@ async def post_shift(p: ShiftIn):
 
 @app.get("/getDetailShifts")
 async def get_shifts(year: int = Query(...), month: int = Query(...), day: int = Query(...)):
+    await ensure_db_ready()
+
     work_tbl, break_tbl = table_names_for(year, month)
     wd = date(year, month, day)
 
@@ -206,6 +226,8 @@ async def get_shifts(year: int = Query(...), month: int = Query(...), day: int =
 
 @app.get("/getWorkMonth")
 async def get_work_month(id: int = Query(..., alias="id"), year: int = Query(...), month: int = Query(...)):
+    await ensure_db_ready()
+
     work_tbl, _ = table_names_for(year, month)
     rows = await database.fetch_all(
         f"""
@@ -228,6 +250,8 @@ async def get_work_month(id: int = Query(..., alias="id"), year: int = Query(...
 # ========= Onboarding / Binding =========
 @app.post("/onboarding/code")
 async def issue_code(payload: dict):
+    await ensure_db_ready()
+
     """管理用: 6桁コード発行（有効10分）"""
     employee_id = int(payload.get("employee_id"))
     code = f"{secrets.randbelow(1_000_000):06d}"
@@ -240,6 +264,8 @@ async def issue_code(payload: dict):
 
 @app.post("/bindings/liff")
 async def bind_from_liff(p: LiffBindIn):
+    await ensure_db_ready()
+
     # コード検証
     row = await database.fetch_one(
         "SELECT employee_id, expires_at, used_at FROM onboarding_code WHERE employee_id=:e AND code=:c",
@@ -277,6 +303,8 @@ async def bind_from_liff(p: LiffBindIn):
 
 @app.get("/bindings")
 async def list_bindings(active: Optional[bool] = None):
+    await ensure_db_ready()
+
     where = ""
     params = {}
     if active is not None:
@@ -290,11 +318,7 @@ async def list_bindings(active: Optional[bool] = None):
     """, params)
     return [dict(r) for r in rows]
 
-# ヘルスチェック（任意）
+# ヘルスチェック（DB 非依存に）
 @app.get("/healthz")
 async def healthz():
-    try:
-        await database.execute("SELECT 1;")
-        return {"ok": True}
-    except Exception as e:
-        raise HTTPException(500, str(e))
+    return {"ok": True}
