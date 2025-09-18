@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator, Field
 import databases
 import secrets
+import re
 
 # ========= DB =========
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -412,3 +413,75 @@ async def seed_token(payload: dict, x_internal_secret: str = Header(None)):
         exp = (dt.datetime.utcnow() + dt.timedelta(seconds=exp)).isoformat()
     await _save_freee_row(at, rt, dt.datetime.fromisoformat(exp.replace("Z","")))
     return {"ok": True}
+
+
+class RequestCodeIn(BaseModel):
+    employee_id: int
+    contact: str          # phone or email
+    channel: str | None = None  # "sms"|"email"|None(auto)
+
+PHONE_RE = re.compile(r"^\+?\d{10,15}$")
+EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+
+async def _send_sms(to: str, text: str):
+    # Twilio例（環境変数 TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM）
+    sid = os.getenv("TWILIO_ACCOUNT_SID"); token = os.getenv("TWILIO_AUTH_TOKEN"); from_ = os.getenv("TWILIO_FROM")
+    if not (sid and token and from_): return
+    async with httpx.AsyncClient(auth=(sid, token), timeout=10) as cli:
+        await cli.post(f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json",
+                       data={"From": from_, "To": to, "Body": text})
+
+async def _send_email(to: str, subject: str, text: str):
+    sg = os.getenv("SENDGRID_API_KEY"); from_addr = os.getenv("FROM_ADDR")
+    if not (sg and from_addr): return
+    payload = {
+      "personalizations":[{"to":[{"email": to}]}],
+      "from":{"email": from_addr},
+      "subject": subject,
+      "content":[{"type":"text/plain","value": text}]
+    }
+    async with httpx.AsyncClient(timeout=10) as cli:
+        await cli.post("https://api.sendgrid.com/v3/mail/send",
+                       headers={"Authorization": f"Bearer {sg}", "Content-Type":"application/json"},
+                       json=payload)
+
+@app.post("/onboarding/request_code")
+async def request_code(p: RequestCodeIn, x_internal_secret: str = Header(None)):
+    await ensure_db_ready()
+    if x_internal_secret != os.getenv("INTERNAL_API_KEY"):
+        raise HTTPException(403, "forbidden")
+
+    contact = p.contact.strip()
+    is_email = bool(EMAIL_RE.match(contact))
+    is_phone = bool(PHONE_RE.match(re.sub(r"[ \-()]", "", contact)))
+    ch = p.channel or ("email" if is_email else "sms")
+    if ch == "email" and not is_email: raise HTTPException(400, "invalid email")
+    if ch == "sms" and not is_phone: raise HTTPException(400, "invalid phone")
+
+    # レート制限（同一社員に60秒以内の再発行を抑制）
+    recent = await database.fetch_one(
+        "SELECT expires_at FROM onboarding_code WHERE employee_id=:e ORDER BY expires_at DESC LIMIT 1",
+        {"e": p.employee_id}
+    )
+    # （必要なら別テーブルで created_at を持たせ、厳密に制御）
+
+    # コード発行
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    expires = dt.datetime.utcnow() + dt.timedelta(minutes=10)
+    await database.execute(
+        "INSERT INTO onboarding_code (employee_id, code, expires_at) VALUES (:e,:c,:x)",
+        {"e": p.employee_id, "c": code, "x": expires},
+    )
+
+    # 送信
+    masked = ""
+    if ch == "sms":
+        await _send_sms(contact, f"LINE連携用確認コード: {code}（10分有効）")
+        masked = contact[:-4].replace(contact[:-4], "*" * len(contact[:-4])) + contact[-4:]
+    else:
+        await _send_email(contact, "LINE連携用6桁コード（10分有効）",
+                          f"社員ID: {p.employee_id}\n確認コード: {code}\n有効期限: 10分")
+        i = contact.find("@")
+        masked = ("*"*max(1, i-2)) + contact[max(0, i-2):i] + contact[i:]
+
+    return {"ok": True, "employee_id": p.employee_id, "channel": ch, "sent_to": masked, "expires_at": expires.isoformat()}
