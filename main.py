@@ -424,26 +424,56 @@ PHONE_RE = re.compile(r"^\+?\d{10,15}$")
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
 async def _send_sms(to: str, text: str):
-    # Twilio例（環境変数 TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM）
-    sid = os.getenv("TWILIO_ACCOUNT_SID"); token = os.getenv("TWILIO_AUTH_TOKEN"); from_ = os.getenv("TWILIO_FROM")
-    if not (sid and token and from_): return
+    sid = os.getenv("TWILIO_ACCOUNT_SID")
+    token = os.getenv("TWILIO_AUTH_TOKEN")
+    from_ = os.getenv("TWILIO_FROM")
+    if not (sid and token and from_):
+        raise HTTPException(400, "SMS provider not configured")
+
     async with httpx.AsyncClient(auth=(sid, token), timeout=10) as cli:
-        await cli.post(f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json",
-                       data={"From": from_, "To": to, "Body": text})
+        r = await cli.post(
+            f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json",
+            data={"From": from_, "To": to, "Body": text},
+        )
+    # Twilioは正常時 201/200 + JSON（sid等）を返します
+    try:
+        body = r.json()
+    except Exception:
+        body = {"raw": r.text}
+
+    if r.status_code >= 300:
+        # 失敗理由を表に出す
+        raise HTTPException(r.status_code, f"twilio error: {body}")
+
+    # ★ ここを返す（レスポンス用に）
+    return {"twilio_status": r.status_code, "sid": body.get("sid"), "twilio_body": body}
 
 async def _send_email(to: str, subject: str, text: str):
-    sg = os.getenv("SENDGRID_API_KEY"); from_addr = os.getenv("FROM_ADDR")
-    if not (sg and from_addr): return
+    sg = os.getenv("SENDGRID_API_KEY")
+    from_addr = os.getenv("FROM_ADDR")
+    if not (sg and from_addr):
+        raise HTTPException(400, "Email provider not configured")
+
     payload = {
       "personalizations":[{"to":[{"email": to}]}],
       "from":{"email": from_addr},
       "subject": subject,
-      "content":[{"type":"text/plain","value": text}]
+      "content":[{"type":"text/plain","value": text}],
     }
     async with httpx.AsyncClient(timeout=10) as cli:
-        await cli.post("https://api.sendgrid.com/v3/mail/send",
-                       headers={"Authorization": f"Bearer {sg}", "Content-Type":"application/json"},
-                       json=payload)
+        r = await cli.post(
+            "https://api.sendgrid.com/v3/mail/send",
+            headers={"Authorization": f"Bearer {sg}", "Content-Type":"application/json"},
+            json=payload,
+        )
+
+    # SendGrid 正常時は 202、本文なし。Message-Id がヘッダに入ることが多いです
+    msg_id = r.headers.get("X-Message-Id") or r.headers.get("X-Message-Id".lower())
+
+    if r.status_code not in (200, 202):
+        raise HTTPException(r.status_code, f"sendgrid error: {r.text}")
+
+    return {"sendgrid_status": r.status_code, "message_id": msg_id}
 
 @app.post("/onboarding/request_code")
 async def request_code(p: RequestCodeIn, x_internal_secret: str = Header(None)):
@@ -484,4 +514,18 @@ async def request_code(p: RequestCodeIn, x_internal_secret: str = Header(None)):
         i = contact.find("@")
         masked = ("*"*max(1, i-2)) + contact[max(0, i-2):i] + contact[i:]
 
-    return {"ok": True, "employee_id": p.employee_id, "channel": ch, "sent_to": masked, "expires_at": expires.isoformat()}
+    info = {}
+    if ch == "sms":
+        info = await _send_sms(contact, f"LINE連携用確認コード: {code}（10分有効）")
+    else:
+        info = await _send_email(contact, "LINE連携用6桁コード（10分有効）",
+                                f"社員ID: {p.employee_id}\n確認コード: {code}\n有効期限: 10分")
+
+    return {
+        "ok": True,
+        "employee_id": p.employee_id,
+        "channel": ch,
+        "sent_to": masked,                # マスク済宛先
+        "expires_at": expires.isoformat(),
+        **info                               # ★ ここで SID / Message-Id を返す
+    }
